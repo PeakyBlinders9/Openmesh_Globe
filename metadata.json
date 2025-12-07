@@ -1,0 +1,5 @@
+{
+  "name": "Neon Gaia - Planetary AI",
+  "description": "A 3D interactive globe visualizing global data with a neon aesthetic, integrated with Gemini AI for planetary analysis.",
+  "requestFramePermissions": []
+}
