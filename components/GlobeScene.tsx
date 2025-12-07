@@ -120,7 +120,7 @@ const LandAuroraFragmentShader = `
     // Use a very wide smoothstep range to create a diffused fade from the "center" of the continent
     // to the "ocean". This removes all sharp edges.
     // water (~1.0) -> 0.0, land (~0.0) -> 1.0
-    float landDensity = smoothstep(0.6, 0.2, mapColor.r);
+    float landDensity = smoothstep(0.75, 0.05, mapColor.r);
     
     // 4. SPOTLIGHT GLOW (The "Active" Continent)
     float dist = distance(normalize(vPosition), normalize(uFocusPoint));
@@ -365,7 +365,7 @@ const GlobeScene: React.FC = () => {
   });
 
   return (
-    <group ref={groupRef}>
+    <group ref={groupRef} scale={0.75}>
       {/* 1. Base Black Sphere (Oceans) */}
       <mesh>
         <sphereGeometry args={[2, 64, 64]} />

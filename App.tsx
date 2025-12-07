@@ -23,6 +23,7 @@ const App: React.FC = () => {
                 <GlobeScene />
                 <OrbitControls 
                     enablePan={false} 
+                    enableZoom={false}
                     minDistance={3} 
                     maxDistance={10} 
                     autoRotate 
