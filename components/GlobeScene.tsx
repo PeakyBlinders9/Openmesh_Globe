@@ -1,12 +1,15 @@
 import React, { useRef, useMemo } from 'react';
 import { useFrame, useLoader } from '@react-three/fiber';
-import { TextureLoader, Color, AdditiveBlending, ShaderMaterial, BufferAttribute, BufferGeometry } from 'three';
+import { TextureLoader, Color, AdditiveBlending, ShaderMaterial, BufferAttribute, BufferGeometry, Vector3 } from 'three';
 import { Stars } from '@react-three/drei';
 
 const EARTH_TEXTURE_URL = "https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/planets/earth_specular_2048.jpg";
 
-// Deep Dark Neon Blue #021266 (Darker than previous #0533F3)
-const NEON_BLUE = new Color('#021266');
+// Updated Aurora Gradient
+// Primary glow: #003CFF – #001F8B
+// Outer fade: #00163D – #000A1C
+const COLOR_A = new Color('#003CFF'); // Primary Bright (Core)
+const COLOR_B = new Color('#000A1C'); // Outer Fade (Edge)
 
 const VertexShader = `
   varying vec2 vUv;
@@ -15,87 +18,200 @@ const VertexShader = `
   void main() {
     vUv = uv;
     vNormal = normalize(normalMatrix * normal);
-    vPosition = position;
+    vPosition = position; // Local position
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
 `;
 
 const LandAuroraFragmentShader = `
   uniform sampler2D globeTexture;
-  uniform vec3 color;
+  uniform vec3 uColorA;
+  uniform vec3 uColorB;
+  uniform vec3 uFocusPoint; // The center of the active area (Local Space)
   uniform float time;
+  
   varying vec2 vUv;
   varying vec3 vNormal;
   varying vec3 vPosition;
 
-  float random(vec2 st) {
-      return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+  // Simplex-like 3D Noise
+  vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+  vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+  vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+  vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+  float snoise(vec3 v) {
+    const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
+    const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+
+    // First corner
+    vec3 i  = floor(v + dot(v, C.yyy) );
+    vec3 x0 = v - i + dot(i, C.xxx) ;
+
+    // Other corners
+    vec3 g = step(x0.yzx, x0.xyz);
+    vec3 l = 1.0 - g;
+    vec3 i1 = min( g.xyz, l.zxy );
+    vec3 i2 = max( g.xyz, l.zxy );
+
+    vec3 x1 = x0 - i1 + C.xxx;
+    vec3 x2 = x0 - i2 + C.yyy; 
+    vec3 x3 = x0 - D.yyy;      
+
+    // Permutations
+    i = mod289(i); 
+    vec4 p = permute( permute( permute( 
+              i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+            + i.y + vec4(0.0, i1.y, i2.y, 1.0 )) 
+            + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+
+    float n_ = 0.142857142857; 
+    vec3  ns = n_ * D.wyz - D.xzx;
+
+    vec4 j = p - 49.0 * floor(p * ns.z * ns.z);  
+
+    vec4 x_ = floor(j * ns.z);
+    vec4 y_ = floor(j - 7.0 * x_ );    
+
+    vec4 x = x_ *ns.x + ns.yyyy;
+    vec4 y = y_ *ns.x + ns.yyyy;
+    vec4 h = 1.0 - abs(x) - abs(y);
+
+    vec4 b0 = vec4( x.xy, y.xy );
+    vec4 b1 = vec4( x.zw, y.zw );
+
+    vec4 s0 = floor(b0)*2.0 + 1.0;
+    vec4 s1 = floor(b1)*2.0 + 1.0;
+    vec4 sh = -step(h, vec4(0.0));
+
+    vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+    vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+
+    vec3 p0 = vec3(a0.xy,h.x);
+    vec3 p1 = vec3(a0.zw,h.y);
+    vec3 p2 = vec3(a1.xy,h.z);
+    vec3 p3 = vec3(a1.zw,h.w);
+
+    vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+    p0 *= norm.x;
+    p1 *= norm.y;
+    p2 *= norm.z;
+    p3 *= norm.w;
+
+    vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+    m = m * m;
+    return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), 
+                                  dot(p2,x2), dot(p3,x3) ) );
   }
 
   void main() {
-    vec4 mapColor = texture2D(globeTexture, vUv);
-    
-    // SPECULAR MAP LOGIC:
-    // Water = White (> 0.5)
-    // Land = Black (< 0.5)
-    
-    // We want Neon on Land.
-    // So if it is Water, discard it.
-    if (mapColor.r > 0.5) discard;
+    // 1. ORGANIC UV DISTORTION
+    // Warp the coordinates slightly with noise to break the rigid cartographic grid.
+    float warp = snoise(vPosition * 1.0 + time * 0.05) * 0.04;
+    vec2 distortedUv = vUv + vec2(warp, -warp);
 
-    // Aurora / Plasma effect animation on land
-    float noise = random(vUv * 50.0);
-    float wave = 0.5 + 0.5 * sin(vPosition.y * 2.5 + time * 0.6 + vPosition.x * 2.0);
+    // 2. ABSTRACT BLUR (Mipmap Bias)
+    // By using a large bias (6.0), we force the GPU to sample a very low-resolution mipmap.
+    // This blurs detailed coastlines into vague, soft blobs.
+    // mapColor.r is 1.0 for Water, 0.0 for Land.
+    vec4 mapColor = texture2D(globeTexture, distortedUv, 6.0);
     
-    // Fresnel rim glow for depth
-    vec3 viewDir = vec3(0.0, 0.0, 1.0);
-    float fresnel = pow(1.0 - dot(vNormal, viewDir), 3.0);
-
-    vec3 finalColor = color;
+    // 3. SOFT SILHOUETTE MASK
+    // Use a very wide smoothstep range to create a diffused fade from the "center" of the continent
+    // to the "ocean". This removes all sharp edges.
+    // water (~1.0) -> 0.0, land (~0.0) -> 1.0
+    float landDensity = smoothstep(0.6, 0.2, mapColor.r);
     
-    // Add pulsing intensity from the wave
-    finalColor *= (0.6 + 0.6 * wave);
+    // 4. SPOTLIGHT GLOW (The "Active" Continent)
+    float dist = distance(normalize(vPosition), normalize(uFocusPoint));
+    // Soft, wide spotlight
+    float spotMask = smoothstep(1.6, 0.2, dist); 
     
-    // Add bright edges (Reduced intensity for darker look)
-    finalColor += color * fresnel * 2.0;
+    // Discard completely dark areas
+    if (spotMask * landDensity < 0.01) discard;
 
-    // Slight digital noise texture
-    finalColor += color * noise * 0.15;
+    // 5. ATMOSPHERIC FLOW
+    // Low frequency noise for "drifting" feel
+    float n = snoise(vPosition * 0.3 + vec3(0.0, time * 0.1, 0.0));
+    float atmosphere = n * 0.2 + 0.8;
+    
+    // 6. BREATHING EFFECT
+    float breath = 0.85 + 0.15 * sin(time * 1.5); 
 
-    gl_FragColor = vec4(finalColor, 0.85);
+    // Combine
+    float strength = landDensity * spotMask * atmosphere * breath;
+
+    // Color mixing
+    vec3 finalColor = mix(uColorB, uColorA, strength);
+    
+    // Highlight - soft glossy core
+    vec3 highlightColor = vec3(0.6, 0.85, 1.0);
+    finalColor += highlightColor * pow(spotMask, 3.0) * 0.5 * strength;
+
+    // Alpha - slightly ghostly
+    float alpha = strength * 0.85; 
+
+    gl_FragColor = vec4(finalColor, alpha);
   }
 `;
 
-// Simplified Vertex Shader - Logic moved to JS
 const ParticlesVertexShader = `
+  uniform float time;
   attribute float size;
+  attribute float phase;
+  attribute float brightness;
+  varying float vOpacity;
+
   void main() {
-    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    vOpacity = brightness;
+
+    // Floating Animation
+    // We oscillate along the surface normal (Radial direction) to simulate "floating up and down"
+    // relative to the ground. This preserves the particle's geographic location.
+    float speed = 1.5;
+    float amplitude = 0.015; 
+    float osc = sin(time * speed + phase) * amplitude;
+    
+    vec3 newPos = position + normalize(position) * osc;
+
+    vec4 mvPosition = modelViewMatrix * vec4(newPos, 1.0);
     gl_Position = projectionMatrix * mvPosition;
-    // Scale by view depth for perspective
-    gl_PointSize = size * (150.0 / -mvPosition.z);
+    
+    // Scale particles based on depth
+    gl_PointSize = size * (100.0 / -mvPosition.z);
   }
 `;
 
 const ParticlesFragmentShader = `
-  uniform vec3 color;
-  
+  varying float vOpacity;
   void main() {
-    // Simple soft circular particle
     vec2 coord = gl_PointCoord - vec2(0.5);
     float dist = length(coord);
+    
+    // Circular crop
     if (dist > 0.5) discard;
     
-    // White center, blueish edge
-    float alpha = 1.0 - smoothstep(0.3, 0.5, dist);
-    gl_FragColor = vec4(mix(vec3(1.0), color, 0.2), alpha);
+    // Sharp falloff for star-like appearance
+    // 1.0 at center, drops quickly
+    float strength = 1.0 - (dist * 2.0);
+    strength = pow(strength, 3.0); 
+
+    gl_FragColor = vec4(vec3(1.0), strength * vOpacity);
   }
 `;
 
 const GlobeScene: React.FC = () => {
   const groupRef = useRef<any>(null);
   const surfaceRef = useRef<any>(null);
+  const particlesRef = useRef<any>(null);
   
+  // Refs for logic (no re-renders)
+  const hoverState = useRef({
+    active: false,
+    point: new Vector3(1, 0, 0)
+  });
+  const currentFocus = useRef(new Vector3(0, 0, 1));
+
   const earthTexture = useLoader(TextureLoader, EARTH_TEXTURE_URL, (loader) => {
     loader.setCrossOrigin('anonymous');
   });
@@ -104,7 +220,9 @@ const GlobeScene: React.FC = () => {
     return new ShaderMaterial({
       uniforms: {
         globeTexture: { value: earthTexture },
-        color: { value: NEON_BLUE },
+        uColorA: { value: COLOR_A },
+        uColorB: { value: COLOR_B },
+        uFocusPoint: { value: new Vector3(0, 0, 1) }, 
         time: { value: 0 }
       },
       vertexShader: VertexShader,
@@ -118,13 +236,15 @@ const GlobeScene: React.FC = () => {
 
   const particlesGeometry = useMemo(() => {
     const geometry = new BufferGeometry();
-    const count = 20000; // High density for dust effect
+    const count = 5500; // Increased density
     
     const positions = [];
     const sizes = [];
+    const phases = [];
+    const brightnesses = [];
+    
     const radius = 2.05;
 
-    // Create a canvas to read the texture data
     let imgData: Uint8ClampedArray | null = null;
     let width = 0;
     let height = 0;
@@ -144,64 +264,55 @@ const GlobeScene: React.FC = () => {
             }
         }
     } catch (e) {
-        console.warn("Could not read texture data for particle filtering:", e);
+        console.warn("Texture data read error:", e);
     }
 
     let validParticles = 0;
     let attempts = 0;
-    const maxAttempts = count * 10; // Prevent infinite loop
+    const maxAttempts = count * 20; 
 
     while (validParticles < count && attempts < maxAttempts) {
         attempts++;
+        const theta = Math.acos(Math.random() * 2 - 1); 
+        const phi = Math.random() * Math.PI * 2; 
 
-        // Random Spherical Coordinates
-        const theta = Math.acos(Math.random() * 2 - 1); // 0 to PI
-        const phi = Math.random() * Math.PI * 2; // 0 to 2PI
-
-        // Calculate UVs to sample texture
-        // u = phi / 2PI
-        // v = 1 - (theta / PI)
         const u = phi / (2 * Math.PI);
         const v = 1 - (theta / Math.PI);
 
-        // Filter Logic
         if (imgData) {
-            // Map UV to pixel coordinates
-            // Texture coordinates: (0,0) is top-left in canvas 2d
-            // v=1 is top (y=0), v=0 is bottom (y=height)
             const x = Math.floor(u * (width - 1));
             const y = Math.floor((1 - v) * (height - 1));
-            
             const index = (y * width + x) * 4;
-            const r = imgData[index]; // Red channel
+            const r = imgData[index]; 
             
-            // Specular Map: Black (0) is Land, White (255) is Water.
-            // Strict check: if red > 40, consider it water/ocean and skip.
-            if (r > 40) {
-                continue;
-            }
+            // Only place particles on Land (Black pixels in specular map)
+            if (r > 40) continue; 
         }
 
-        // If we are here, it's land (or we have no data to filter)
-        
-        // Convert to Cartesian
         const px = -radius * Math.sin(theta) * Math.cos(phi);
         const py = radius * Math.cos(theta);
         const pz = radius * Math.sin(theta) * Math.sin(phi);
 
         positions.push(px, py, pz);
-        
-        // Tiny uneven sizes for "dust" effect: 0.05 to 0.15
-        sizes.push(Math.random() * 0.10 + 0.05);
-        
+        // Size Range: 0.1 to 0.6
+        sizes.push(Math.random() * 0.5 + 0.1); 
+        // Random phase for independent animation
+        phases.push(Math.random() * Math.PI * 2);
+        // Varying brightness
+        brightnesses.push(Math.random() * 0.5 + 0.5);
+
         validParticles++;
     }
 
     const positionArray = new Float32Array(positions);
     const sizeArray = new Float32Array(sizes);
+    const phaseArray = new Float32Array(phases);
+    const brightnessArray = new Float32Array(brightnesses);
 
     geometry.setAttribute('position', new BufferAttribute(positionArray, 3));
     geometry.setAttribute('size', new BufferAttribute(sizeArray, 1));
+    geometry.setAttribute('phase', new BufferAttribute(phaseArray, 1));
+    geometry.setAttribute('brightness', new BufferAttribute(brightnessArray, 1));
     
     return geometry;
   }, [earthTexture]);
@@ -209,7 +320,7 @@ const GlobeScene: React.FC = () => {
   const particlesMaterial = useMemo(() => {
       return new ShaderMaterial({
         uniforms: {
-            color: { value: new Color('#88ccff') }
+            time: { value: 0 }
         },
         vertexShader: ParticlesVertexShader,
         fragmentShader: ParticlesFragmentShader,
@@ -219,31 +330,69 @@ const GlobeScene: React.FC = () => {
       });
   }, []);
 
-  useFrame((state) => {
+  useFrame((state, delta) => {
+    // 1. Rotate the entire globe group
     if (groupRef.current) {
       groupRef.current.rotation.y += 0.0015;
     }
+
+    // 2. Determine Target Focus Point
+    const target = new Vector3();
+
+    if (hoverState.current.active) {
+        // CASE A: User is hovering. 
+        target.copy(hoverState.current.point);
+    } else {
+        // CASE B: Default "Camera Facing" logic.
+        if (surfaceRef.current) {
+            const camPos = state.camera.position.clone();
+            surfaceRef.current.worldToLocal(camPos); 
+            target.copy(camPos).normalize();
+        }
+    }
+
+    // 3. Smoothly interpolate current focus to target
+    currentFocus.current.lerp(target, 0.1);
+
+    // 4. Update Shader Time & Uniforms
     if (surfaceRef.current) {
-        surfaceRef.current.material.uniforms.time.value = state.clock.getElapsedTime();
+        surfaceRef.current.material.uniforms.time.value += delta;
+        surfaceRef.current.material.uniforms.uFocusPoint.value.copy(currentFocus.current);
+    }
+    if (particlesRef.current) {
+        particlesRef.current.material.uniforms.time.value += delta;
     }
   });
 
   return (
     <group ref={groupRef}>
-      {/* 1. Base Black Sphere (The Void / Water Background) */}
+      {/* 1. Base Black Sphere (Oceans) */}
       <mesh>
         <sphereGeometry args={[2, 64, 64]} />
         <meshBasicMaterial color="#000000" />
       </mesh>
 
-      {/* 2. Neon Land Aurora (Only renders on land pixels) */}
-      <mesh ref={surfaceRef}>
+      {/* 2. Abstract Smooth Aurora Land Glow */}
+      <mesh 
+        ref={surfaceRef}
+        onPointerMove={(e) => {
+            e.stopPropagation();
+            if (surfaceRef.current) {
+                const localPoint = surfaceRef.current.worldToLocal(e.point.clone());
+                hoverState.current.active = true;
+                hoverState.current.point.copy(localPoint).normalize();
+            }
+        }}
+        onPointerOut={() => {
+            hoverState.current.active = false;
+        }}
+      >
         <sphereGeometry args={[2.01, 128, 128]} />
         <primitive object={landMaterial} attach="material" />
       </mesh>
 
-      {/* 3. Random Particles (Pre-filtered to Land Only) */}
-      <points geometry={particlesGeometry}>
+      {/* 3. Random Star Particles (Foreground) */}
+      <points ref={particlesRef} geometry={particlesGeometry}>
          <primitive object={particlesMaterial} attach="material" />
       </points>
       
