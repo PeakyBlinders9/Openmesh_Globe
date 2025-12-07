@@ -28,6 +28,7 @@ const LandAuroraFragmentShader = `
   uniform vec3 uColorA;
   uniform vec3 uColorB;
   uniform vec3 uFocusPoint; // The center of the active area (Local Space)
+  uniform float uDistortionStrength;
   uniform float time;
   
   varying vec2 vUv;
@@ -105,37 +106,59 @@ const LandAuroraFragmentShader = `
   }
 
   void main() {
-    // 1. ORGANIC UV DISTORTION
+    // Distance from current pixel to the focus point (mouse/camera center)
+    float mouseDist = distance(normalize(vPosition), normalize(uFocusPoint));
+
+    // --- LIQUID DISTORTION LOGIC ---
+    // 1. Create a mask that is strong near the focus point and fades out
+    float liquidRadius = 0.6;
+    float liquidMask = smoothstep(liquidRadius, 0.0, mouseDist);
+
+    // 2. Calculate a ripple wave pattern
+    // sin(distance - time) creates outward movement
+    float ripple = sin(mouseDist * 20.0 - time * 4.0);
+
+    // 3. Determine flow direction (pushing away/around the center)
+    // We project the 3D direction onto the 2D UV plane roughly
+    vec2 flowDir = normalize(vPosition.xy - uFocusPoint.xy);
+    
+    // 4. Calculate final distortion vector
+    // intensity * mask * wave * direction * strength
+    vec2 liquidOffset = flowDir * liquidMask * ripple * 0.03 * uDistortionStrength;
+
+
+    // --- 1. ORGANIC UV DISTORTION (Base) ---
     // Warp the coordinates slightly with noise to break the rigid cartographic grid.
     float warp = snoise(vPosition * 1.0 + time * 0.05) * 0.04;
-    vec2 distortedUv = vUv + vec2(warp, -warp);
+    
+    // Apply both the base noise warp AND the interactive liquid distortion to the UVs
+    vec2 distortedUv = vUv + vec2(warp, -warp) + liquidOffset;
 
-    // 2. ABSTRACT BLUR (Mipmap Bias)
+    // --- 2. ABSTRACT BLUR (Mipmap Bias) ---
     // By using a large bias (6.0), we force the GPU to sample a very low-resolution mipmap.
-    // This blurs detailed coastlines into vague, soft blobs.
-    // mapColor.r is 1.0 for Water, 0.0 for Land.
     vec4 mapColor = texture2D(globeTexture, distortedUv, 6.0);
     
-    // 3. SOFT SILHOUETTE MASK
-    // Use a very wide smoothstep range to create a diffused fade from the "center" of the continent
-    // to the "ocean". This removes all sharp edges.
+    // --- 3. SOFT SILHOUETTE MASK ---
     // water (~1.0) -> 0.0, land (~0.0) -> 1.0
     float landDensity = smoothstep(0.75, 0.05, mapColor.r);
     
-    // 4. SPOTLIGHT GLOW (The "Active" Continent)
-    float dist = distance(normalize(vPosition), normalize(uFocusPoint));
+    // --- 4. SPOTLIGHT GLOW (The "Active" Continent) ---
     // Soft, wide spotlight
-    float spotMask = smoothstep(1.6, 0.2, dist); 
+    float spotMask = smoothstep(1.6, 0.2, mouseDist); 
     
     // Discard completely dark areas
     if (spotMask * landDensity < 0.01) discard;
 
-    // 5. ATMOSPHERIC FLOW
+    // --- 5. ATMOSPHERIC FLOW ---
     // Low frequency noise for "drifting" feel
-    float n = snoise(vPosition * 0.3 + vec3(0.0, time * 0.1, 0.0));
+    // We also distort the noise lookup position slightly with the liquid mask for extra turbulence
+    vec3 noisePos = vPosition * 0.3 + vec3(0.0, time * 0.1, 0.0);
+    noisePos += vec3(liquidOffset, 0.0) * 2.0; 
+
+    float n = snoise(noisePos);
     float atmosphere = n * 0.2 + 0.8;
     
-    // 6. BREATHING EFFECT
+    // --- 6. BREATHING EFFECT ---
     float breath = 0.85 + 0.15 * sin(time * 1.5); 
 
     // Combine
@@ -157,6 +180,8 @@ const LandAuroraFragmentShader = `
 
 const ParticlesVertexShader = `
   uniform float time;
+  uniform vec3 uFocusPoint;
+  uniform float uDistortionStrength;
   attribute float size;
   attribute float phase;
   attribute float brightness;
@@ -165,16 +190,33 @@ const ParticlesVertexShader = `
   void main() {
     vOpacity = brightness;
 
-    // Floating Animation
+    vec3 pos = position;
+
+    // --- LIQUID DISTORTION (Match LandShader) ---
+    float mouseDist = distance(normalize(pos), normalize(uFocusPoint));
+    float liquidRadius = 0.6;
+    float liquidMask = smoothstep(liquidRadius, 0.0, mouseDist);
+    float ripple = sin(mouseDist * 20.0 - time * 4.0);
+    
+    // Direction away from focus point
+    vec3 flowDir = normalize(pos - uFocusPoint);
+    
+    // Displace particles physically in 3D space to match the visual liquid wave
+    vec3 distortion = flowDir * liquidMask * ripple * 0.05 * uDistortionStrength;
+    pos += distortion;
+
+    // --- FLOATING ANIMATION ---
     // We oscillate along the surface normal (Radial direction) to simulate "floating up and down"
     // relative to the ground. This preserves the particle's geographic location.
     float speed = 1.5;
     float amplitude = 0.015; 
     float osc = sin(time * speed + phase) * amplitude;
     
-    vec3 newPos = position + normalize(position) * osc;
+    // Apply floating oscillation on top of distortion
+    // We use original position for normal to keep orientation consistent
+    pos += normalize(position) * osc;
 
-    vec4 mvPosition = modelViewMatrix * vec4(newPos, 1.0);
+    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mvPosition;
     
     // Scale particles based on depth
@@ -211,6 +253,7 @@ const GlobeScene: React.FC = () => {
     point: new Vector3(1, 0, 0)
   });
   const currentFocus = useRef(new Vector3(0, 0, 1));
+  const distortionStrength = useRef(0);
 
   const earthTexture = useLoader(TextureLoader, EARTH_TEXTURE_URL, (loader) => {
     loader.setCrossOrigin('anonymous');
@@ -222,7 +265,8 @@ const GlobeScene: React.FC = () => {
         globeTexture: { value: earthTexture },
         uColorA: { value: COLOR_A },
         uColorB: { value: COLOR_B },
-        uFocusPoint: { value: new Vector3(0, 0, 1) }, 
+        uFocusPoint: { value: new Vector3(0, 0, 1) },
+        uDistortionStrength: { value: 0 }, 
         time: { value: 0 }
       },
       vertexShader: VertexShader,
@@ -320,7 +364,9 @@ const GlobeScene: React.FC = () => {
   const particlesMaterial = useMemo(() => {
       return new ShaderMaterial({
         uniforms: {
-            time: { value: 0 }
+            time: { value: 0 },
+            uFocusPoint: { value: new Vector3(0, 0, 1) },
+            uDistortionStrength: { value: 0 }
         },
         vertexShader: ParticlesVertexShader,
         fragmentShader: ParticlesFragmentShader,
@@ -354,13 +400,20 @@ const GlobeScene: React.FC = () => {
     // 3. Smoothly interpolate current focus to target
     currentFocus.current.lerp(target, 0.1);
 
-    // 4. Update Shader Time & Uniforms
+    // 4. Interpolate Distortion Strength (0 = idle, 1 = hovering)
+    const targetStrength = hoverState.current.active ? 1.0 : 0.0;
+    distortionStrength.current += (targetStrength - distortionStrength.current) * 0.1;
+
+    // 5. Update Shader Time & Uniforms
     if (surfaceRef.current) {
         surfaceRef.current.material.uniforms.time.value += delta;
         surfaceRef.current.material.uniforms.uFocusPoint.value.copy(currentFocus.current);
+        surfaceRef.current.material.uniforms.uDistortionStrength.value = distortionStrength.current;
     }
     if (particlesRef.current) {
         particlesRef.current.material.uniforms.time.value += delta;
+        particlesRef.current.material.uniforms.uFocusPoint.value.copy(currentFocus.current);
+        particlesRef.current.material.uniforms.uDistortionStrength.value = distortionStrength.current;
     }
   });
 
